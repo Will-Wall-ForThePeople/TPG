@@ -20,6 +20,8 @@ logging.basicConfig(
     ]
 )
 
+logger = logging.getLogger(__name__)
+
 # Convert UTC timestamp string to US Eastern Time
 def convert_to_est(utc_time_str):
     """Convert UTC timestamp to EST/EDT"""
@@ -38,10 +40,10 @@ def convert_to_est(utc_time_str):
         utc_time = utc_time.replace(tzinfo=pytz.UTC)
         est = pytz.timezone("US/Eastern")
         est_time = utc_time.astimezone(est)
-        return est_time.strftime('%Y-%m-%d %H:%M:%S')
+        return est_time
     except Exception as e:
-        logging.warning(f"Could not convert timestamp {utc_time_str}: {e}")
-        return utc_time_str
+        logger.warning(f"Could not convert timestamp {utc_time_str}: {e}")
+        return pd.to_datetime(utc_time_str)
 
 def save_csv(container_client, df, path):
     csv_buffer = StringIO()
@@ -49,7 +51,7 @@ def save_csv(container_client, df, path):
     csv_data = csv_buffer.getvalue().encode('utf-8-sig')
     blob_client = container_client.get_blob_client(path)
     blob_client.upload_blob(csv_data, overwrite=True)
-    logging.info(f"Saved CSV to {path}")
+    logger.info(f"Saved CSV to {path} with {len(df)} rows")
 
 def get_credential(enable_probe: bool = True):
     logger = logging.getLogger("auth")
@@ -92,7 +94,6 @@ def get_blob_service_client():
     azure_vault_url = 'https://mm-ccc-project-team-kv.vault.azure.net/'
 
     secret_client = SecretClient(vault_url=azure_vault_url, credential=credential)
-    # Secret name expected: "azure-connection-string"
     connection_string = secret_client.get_secret("azure-connection-string").value
     return BlobServiceClient.from_connection_string(connection_string)
 
@@ -100,13 +101,13 @@ def get_blob_service_client():
 blob_service_client = get_blob_service_client()
 container_client = blob_service_client.get_container_client("tpg-data")
 
-# Download the blob data
-logging.info("Downloading TPG data...")
+# Download the blob data from warehouse
+logger.info("Downloading TPG data from warehouse...")
 tpg_blob = container_client.get_blob_client("MM_173_TPG_DATA")
 tpg_data = tpg_blob.download_blob().readall()
 tpg_df = pd.read_parquet(io.BytesIO(tpg_data), engine="pyarrow")
 
-logging.info(f"Loaded {len(tpg_df)} rows")
+logger.info(f"Loaded {len(tpg_df)} rows from warehouse")
 
 # Rename columns
 tpg_df = tpg_df.rename(columns={
@@ -126,11 +127,10 @@ columns_to_keep = ["Evaluation Date", "Agent", "AgentEmail", "Supervisor",
 tpg_df = tpg_df[columns_to_keep]
 
 # Clean up the Evaluation Date column
-logging.info("Cleaning up Evaluation Date column...")
+logger.info("Cleaning up Evaluation Date column...")
 
-# First, check if the date column contains string timestamps
+# Convert string timestamps to datetime if needed
 if tpg_df["Evaluation Date"].dtype == 'object':
-    # If dates are strings with timezone info, convert them
     tpg_df["Evaluation Date"] = tpg_df["Evaluation Date"].apply(
         lambda x: convert_to_est(x) if pd.notna(x) and isinstance(x, str) else x
     )
@@ -141,18 +141,16 @@ tpg_df["Evaluation Date"] = pd.to_datetime(tpg_df["Evaluation Date"], errors="co
 # Extract just the date part for grouping
 tpg_df["Date"] = tpg_df["Evaluation Date"].dt.date
 
-# Log any rows with invalid dates
+# Remove rows with invalid dates
 invalid_dates = tpg_df[tpg_df["Date"].isna()]
 if not invalid_dates.empty:
-    logging.warning(f"Found {len(invalid_dates)} rows with invalid dates")
-    logging.info("Sample of invalid date rows:")
-    logging.info(invalid_dates.head())
+    logger.warning(f"Found {len(invalid_dates)} rows with invalid dates")
 
-# Remove rows with invalid dates
 tpg_df = tpg_df.dropna(subset=["Date"])
 
-logging.info(f"After date cleanup: {len(tpg_df)} rows")
-logging.info(f"Date range: {tpg_df['Date'].min()} to {tpg_df['Date'].max()}")
+logger.info(f"After date cleanup: {len(tpg_df)} rows")
+logger.info(f"Date range: {tpg_df['Date'].min()} to {tpg_df['Date'].max()}")
+logger.info(f"Unique dates in data: {tpg_df['Date'].nunique()}")
 
 # Define target behaviors
 target_behaviors = [
@@ -165,98 +163,151 @@ target_behaviors = [
 
 # Filter for target behaviors
 filtered_df = tpg_df[tpg_df['Behavior Text'].isin(target_behaviors)]
-logging.info(f"Filtered to {len(filtered_df)} rows with target behaviors")
+logger.info(f"Filtered to {len(filtered_df)} rows with target behaviors")
 
-# Calculate behavior statistics
+# IMPORTANT: Calculate behavior statistics PER DATE AND AGENT
+logger.info("Calculating behavior statistics by date and agent...")
 behavior_stats = filtered_df.groupby(['Date', 'Agent', 'Behavior Text'], as_index=False).agg({
     'IsDefect': 'sum',
     'IsOpportunity': 'sum'
 })
 
-behavior_stats['IsDefect'] = pd.to_numeric(behavior_stats['IsDefect'], errors='coerce')
-behavior_stats['IsOpportunity'] = pd.to_numeric(behavior_stats['IsOpportunity'], errors='coerce')
+behavior_stats['IsDefect'] = pd.to_numeric(behavior_stats['IsDefect'], errors='coerce').fillna(0)
+behavior_stats['IsOpportunity'] = pd.to_numeric(behavior_stats['IsOpportunity'], errors='coerce').fillna(0)
 
-# Calculate defect rate, handling division by zero
+# Calculate defect rate
 behavior_stats['DefectRate'] = behavior_stats.apply(
     lambda row: round(row['IsDefect'] / row['IsOpportunity'], 2) 
     if row['IsOpportunity'] > 0 else 0, axis=1
 )
 
-# Calculate totals per agent
-totals = tpg_df.groupby(['Agent'], as_index=False).agg({
-    'IsDefect': 'sum',
-    'IsOpportunity': 'sum'
-})
-
-totals['IsDefect'] = pd.to_numeric(totals['IsDefect'], errors='coerce')
-totals['IsOpportunity'] = pd.to_numeric(totals['IsOpportunity'], errors='coerce')
-
-# Calculate overall defect rate per agent
-totals['DefectRate'] = totals.apply(
-    lambda row: round(row['IsDefect'] / row['IsOpportunity'], 2) 
-    if row['IsOpportunity'] > 0 else 0, axis=1
-)
-totals = totals[['Agent', 'DefectRate']]
-
-# Create pivot table for behaviors
+# Create pivot table for behaviors - BY DATE AND AGENT
+logger.info("Creating behavior pivot table...")
 behavior_pivot = behavior_stats.pivot_table(
-    index='Agent',
+    index=['Date', 'Agent'],
     columns='Behavior Text',
     values='DefectRate',
     aggfunc='first'
 ).round(2)
 behavior_pivot = behavior_pivot.reset_index()
 
-# Calculate delight scores
+# Calculate totals PER DATE AND AGENT
+logger.info("Calculating totals by date and agent...")
+totals = tpg_df.groupby(['Date', 'Agent'], as_index=False).agg({
+    'IsDefect': 'sum',
+    'IsOpportunity': 'sum'
+})
+
+totals['IsDefect'] = pd.to_numeric(totals['IsDefect'], errors='coerce').fillna(0)
+totals['IsOpportunity'] = pd.to_numeric(totals['IsOpportunity'], errors='coerce').fillna(0)
+
+# Calculate overall defect rate
+totals['DefectRate'] = totals.apply(
+    lambda row: round(row['IsDefect'] / row['IsOpportunity'], 2) 
+    if row['IsOpportunity'] > 0 else 0, axis=1
+)
+totals = totals[['Date', 'Agent', 'DefectRate']]
+
+# Calculate delight scores PER DATE AND AGENT
+logger.info("Calculating delight scores by date and agent...")
 delight_df = tpg_df[tpg_df['Behavior Text'] == "Customer demeanor at end of call"]
 delight_df["Response"] = delight_df["Response"].astype(str).str.strip()
 
-delight_counts = delight_df.groupby(["Agent", "Response"], dropna=False).size().unstack(
-    "Response", fill_value=0
-).reset_index()
-
-# Calculate delight percentage
-if 'Audibly happy' in delight_counts.columns:
+if not delight_df.empty:
+    delight_counts = delight_df.groupby(['Date', 'Agent', 'Response'], dropna=False).size().unstack(
+        'Response', fill_value=0
+    ).reset_index()
+    
+    # Ensure all expected columns exist
+    for col in ['Audibly happy', 'Neutral', 'Irate']:
+        if col not in delight_counts.columns:
+            delight_counts[col] = 0
+    
+    # Calculate delight percentage
     total_responses = delight_counts[['Audibly happy', 'Neutral', 'Irate']].sum(axis=1)
     delight_counts['Delight'] = delight_counts.apply(
         lambda row: round(row['Audibly happy'] / total_responses[row.name], 2) 
         if total_responses[row.name] > 0 else 0, axis=1
     )
+    delight_counts = delight_counts[['Date', 'Agent', 'Delight']]
 else:
-    delight_counts['Delight'] = 0
+    # Create empty delight dataframe if no data
+    delight_counts = pd.DataFrame(columns=['Date', 'Agent', 'Delight'])
 
-delight_counts = delight_counts[['Agent', 'Delight']]
-
-# Get unique agent information with the most recent evaluation date
-df_unique = tpg_df.sort_values('Evaluation Date').groupby('Agent').last().reset_index()
-df_unique = df_unique[["Evaluation Date", "Agent", "AgentEmail", "Supervisor"]]
+# Get agent information WITH DATE
+logger.info("Compiling agent information by date...")
+# Keep one row per agent per date with their info
+agent_info = tpg_df.groupby(['Date', 'Agent']).agg({
+    'Evaluation Date': 'max',  # Get the latest evaluation datetime for that date
+    'AgentEmail': 'first',
+    'Supervisor': 'first'
+}).reset_index()
 
 # Format the Evaluation Date for output
-df_unique['Evaluation Date'] = df_unique['Evaluation Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+agent_info['Evaluation Date'] = agent_info['Evaluation Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
-# Merge all dataframes
-final_df = df_unique.merge(behavior_pivot, on='Agent', how='left')
-final_df = final_df.merge(totals, on='Agent', how='left')
-final_df = final_df.merge(delight_counts, on='Agent', how='left')
+# MERGE ALL DATAFRAMES - maintaining date granularity
+logger.info("Merging all data...")
+final_df = agent_info.merge(
+    behavior_pivot, 
+    on=['Date', 'Agent'], 
+    how='left'
+)
+final_df = final_df.merge(
+    totals, 
+    on=['Date', 'Agent'], 
+    how='left'
+)
+final_df = final_df.merge(
+    delight_counts, 
+    on=['Date', 'Agent'], 
+    how='left'
+)
 
 # Fill NaN values with 0 for numeric columns
 numeric_columns = final_df.select_dtypes(include=['float64', 'int64']).columns
 final_df[numeric_columns] = final_df[numeric_columns].fillna(0)
 
-logging.info(f"Final dataset has {len(final_df)} agents")
-logging.info("Columns in final dataset:")
-logging.info(final_df.columns.tolist())
+# Sort by Date and Agent for better readability
+final_df = final_df.sort_values(['Date', 'Agent'])
 
-# Save to blob storage
+# Convert Date to string for CSV output
+final_df['Date'] = final_df['Date'].astype(str)
+
+logger.info(f"Final dataset has {len(final_df)} rows (agent-date combinations)")
+logger.info(f"Unique dates: {final_df['Date'].nunique()}")
+logger.info(f"Unique agents: {final_df['Agent'].nunique()}")
+logger.info("Columns in final dataset:")
+logger.info(final_df.columns.tolist())
+
+# Save to blob storage - now includes multiple dates
 storage_container = blob_service_client.get_container_client('centrical-data')
-storage_path = f"TPG/CENTRICAL_TPG.csv"
+storage_path = f"TPG/CENTRICAL_TPG_WAREHOUSE.csv"
 
 save_csv(storage_container, final_df, storage_path)
-logging.info("Process completed successfully!")
+logger.info("Process completed successfully!")
 
 # Display summary statistics
 print("\n=== Summary Statistics ===")
-print(f"Total agents: {len(final_df)}")
-print(f"Date range: {tpg_df['Date'].min()} to {tpg_df['Date'].max()}")
-print(f"\nSample of final data:")
-print(final_df.head())
+print(f"Total rows: {len(final_df)}")
+print(f"Date range: {final_df['Date'].min()} to {final_df['Date'].max()}")
+print(f"Unique dates: {final_df['Date'].nunique()}")
+print(f"Unique agents: {final_df['Agent'].nunique()}")
+print(f"\nSample of final data (first 10 rows):")
+print(final_df.head(10))
+
+# Show date distribution
+print(f"\nRows per date:")
+date_distribution = final_df.groupby('Date').size().sort_index()
+print(date_distribution)
+
+# Optional: Save separate files per date if needed
+save_by_date = os.getenv("SAVE_BY_DATE", "false").lower() == "true"
+if save_by_date:
+    logger.info("Saving separate files by date...")
+    for date in final_df['Date'].unique():
+        date_df = final_df[final_df['Date'] == date]
+        date_str = date.replace('-', '')
+        date_path = f"TPG/Daily/CENTRICAL_TPG_{date_str}.csv"
+        save_csv(storage_container, date_df, date_path)
+        logger.info(f"Saved {len(date_df)} rows for date {date}")
